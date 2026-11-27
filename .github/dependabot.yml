@@ -1,0 +1,24 @@
+# Dependabot: revisa las dependencias de Python (requirements*.txt) y abre PRs con las actualizaciones.
+# Las actualizaciones se agrupan en UN solo PR porque Flask, Werkzeug y Jinja2 dependen entre sí:
+# actualizar solo uno rompería la instalación (ej.: Flask 3 exige Werkzeug 3).
+version: 2
+updates:
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "daily"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencias"
+      - "seguridad"
+    commit-message:
+      prefix: "DEP"
+    groups:
+      dependencias-seguridad:
+        applies-to: security-updates
+        patterns:
+          - "*"
+      dependencias-python:
+        applies-to: version-updates
+        patterns:
+          - "*"
