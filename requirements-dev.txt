@@ -1,2 +1,4 @@
-# Dependencias solo para pruebas (no se instalan en los despliegues).
-pytest==9.0.3
+
+dependabot/pip/dependencias-python-a38d1fa615
+pytest==9.2.0
+
