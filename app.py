@@ -201,12 +201,16 @@ def buscar_alumnos():
     @brief Busca alumnos cuyo nombre contenga el texto del parámetro «nombre».
     @return JSON con los alumnos encontrados.
     """
-    nombre = request.args.get("nombre", "")
-    consulta = f"SELECT * FROM alumnos WHERE nombre LIKE '%{nombre}%'"
+    nombre = request.args.get("nombre", "")[:100]
+    # Consulta parametrizada: el valor viaja separado del SQL y nunca se interpreta como código.
     try:
-        filas = conectar().execute(consulta).fetchall()
-    except sqlite3.Error as error:
-        return jsonify({"error": str(error), "consulta": consulta}), 500
+        filas = conectar().execute(
+            "SELECT * FROM alumnos WHERE nombre LIKE ? ORDER BY id", (f"%{nombre}%",)
+        ).fetchall()
+    except sqlite3.Error:
+        # Se registra el detalle en el log del servidor, pero al cliente no se le muestra SQL ni el error.
+        app.logger.exception("Error al buscar alumnos")
+        return jsonify({"error": "Error interno"}), 500
     return jsonify([dict(f) for f in filas])
 
 
