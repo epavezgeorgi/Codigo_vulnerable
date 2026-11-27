@@ -49,12 +49,55 @@ pipeline {
             }
         }
 
-        // >>> [SEGURIDAD]: aquí van las etapas "Security Review (SAST)" y "Dependency Management"
+        // >>> [SEGURIDAD] Revisión del código (SAST) con Bandit
+        stage('Security Review (SAST)') {
+            steps {
+                // Reportes completos (todas las severidades) para el registro y la trazabilidad
+                sh 'bandit -f json -o reports/bandit.json app.py || true'
+                sh 'bandit -f txt -o reports/bandit.txt app.py || true'
+                // Hallazgos Medium o High marcan el build como UNSTABLE (y bloquean producción)
+                catchError(buildResult: 'UNSTABLE', stageResult: 'UNSTABLE') {
+                    sh 'bandit -q -ll app.py'
+                }
+            }
+        }
 
-        // >>> [ZAP]: aquí van las etapas "Deploy Staging" y "DAST - OWASP ZAP"
+        // >>> [SEGURIDAD] Dependencias con vulnerabilidades conocidas (SCA) con pip-audit
+        stage('Dependency Management') {
+            steps {
+                sh 'pip-audit -r requirements.txt -f json -o reports/pip-audit.json || true'
+                catchError(buildResult: 'UNSTABLE', stageResult: 'UNSTABLE') {
+                    sh '''
+                        rc=0
+                        pip-audit -r requirements.txt > reports/pip-audit.txt 2>&1 || rc=$?
+                        cat reports/pip-audit.txt
+                        exit $rc
+                    '''
+                }
+            }
+        }
+
+        // >>> [ZAP] Despliegue en staging (puerto 5001) para el análisis dinámico
+        stage('Deploy Staging') {
+            steps {
+                sh 'bash scripts/deploy.sh staging 5001'
+            }
+        }
+
+        // >>> [ZAP] Pruebas dinámicas (DAST) con OWASP ZAP sobre staging
+        stage('DAST - OWASP ZAP') {
+            steps {
+                catchError(buildResult: 'UNSTABLE', stageResult: 'UNSTABLE') {
+                    sh 'python3 scripts/zap_scan.py http://jenkins:5001'
+                }
+            }
+        }
 
         stage('Deploy Producción') {
-            // >>> [GATE]: aquí va la condición "when" que protege producción
+            // >>> [GATE] Solo se despliega en producción si TODAS las etapas anteriores quedaron en verde
+            when {
+                expression { currentBuild.currentResult == 'SUCCESS' }
+            }
             steps {
                 sh 'bash scripts/deploy.sh produccion 5000'
                 script { env.PRODUCCION = env.APP_VERSION }
