@@ -1,4 +1,2 @@
-
-dependabot/pip/dependencias-python-a38d1fa615
 pytest==9.2.0
 
