@@ -8,6 +8,7 @@ Las métricas de seguridad (logins fallidos y peticiones sospechosas) se ven en 
 import hashlib
 import os
 import re
+import secrets
 import sqlite3
 import time
 
@@ -17,8 +18,9 @@ from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, Histogram, ge
 
 app = Flask(__name__)
 
-## Clave de la aplicación y credenciales del administrador.
-SECRET_KEY = "SecureDev-2024-clave-super-secreta"
+## Clave de la aplicación: se lee del entorno (credencial de Jenkins / gestor de secretos).
+## Si no se entrega, se genera una aleatoria al iniciar: nunca queda escrita en el código ni en Git.
+SECRET_KEY = os.environ.get("SECRET_KEY") or secrets.token_hex(32)
 ADMIN_USUARIO = "admin"
 ADMIN_CLAVE_MD5 = "21232f297a57a5a743894a0e4a801fc3"
 app.config["SECRET_KEY"] = SECRET_KEY
