@@ -13,7 +13,7 @@ import sqlite3
 import threading
 import time
 
-from flask import Flask, Response, g, jsonify, render_template_string, request
+from flask import Flask, Response, abort, g, jsonify, render_template_string, request, session
 from markupsafe import escape
 from werkzeug.security import check_password_hash
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, Histogram, generate_latest
@@ -29,6 +29,11 @@ ADMIN_USUARIO = os.environ.get("ADMIN_USUARIO", "admin")
 ## (no hay clave por defecto como "admin").
 ADMIN_CLAVE_HASH = os.environ.get("ADMIN_CLAVE_HASH", "")
 app.config["SECRET_KEY"] = SECRET_KEY
+# Cookie de sesión (guarda el token anti-CSRF): no accesible desde JavaScript y no se envía desde otros sitios.
+app.config["SESSION_COOKIE_HTTPONLY"] = True
+app.config["SESSION_COOKIE_SAMESITE"] = "Strict"
+# Con HTTPS en un servidor real también: SESSION_COOKIE_SECURE=True (en el laboratorio se usa HTTP).
+app.config["SESSION_COOKIE_SECURE"] = os.environ.get("COOKIE_SECURE", "0") == "1"
 
 ## Versión desplegada: la inyecta el pipeline (1.0.<build>+<commit>). Sirve para la trazabilidad.
 VERSION = os.environ.get("APP_VERSION", "dev")
@@ -100,15 +105,38 @@ PORTADA = """<!doctype html>
 </ul>
 <h2>Buscar alumno</h2>
 <form action="/alumnos/buscar" method="get">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
   <input name="nombre" value="Ana"> <button type="submit">Buscar</button>
 </form>
 <h2>Acceso administrador</h2>
 <form action="/login" method="post">
-  <input name="usuario" value="admin"> <input name="clave" type="password" value="">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+  <input name="usuario" value="admin"> <input name="clave" type="password" value="" autocomplete="off">
   <button type="submit">Entrar</button>
 </form>
 </body>
 </html>"""
+
+
+def token_csrf():
+    """!
+    @brief Devuelve el token anti-CSRF de la sesión (lo crea la primera vez).
+    @return Token aleatorio de 64 caracteres hexadecimales.
+    """
+    if "csrf_token" not in session:
+        session["csrf_token"] = secrets.token_hex(32)
+    return session["csrf_token"]
+
+
+def validar_csrf():
+    """!
+    @brief Rechaza (HTTP 400) un formulario POST cuyo token no coincide con el de la sesión.
+    """
+    enviado = request.form.get("csrf_token", "")
+    esperado = session.get("csrf_token", "")
+    if not esperado or not hmac.compare_digest(enviado, esperado):
+        app.logger.warning("Token CSRF inválido desde %s a %s", request.remote_addr, request.path)
+        abort(400, description="Token CSRF inválido")
 
 
 def conectar():
@@ -178,7 +206,7 @@ def portada():
     @brief Portada HTML con enlaces y formularios del sistema.
     @return Página HTML.
     """
-    return render_template_string(PORTADA, version=VERSION)
+    return render_template_string(PORTADA, version=VERSION, csrf_token=token_csrf())
 
 
 @app.route("/hello")
@@ -263,6 +291,7 @@ def login():
         LOGIN_FALLIDOS.inc()
         app.logger.warning("Login bloqueado por exceso de intentos desde %s", ip)
         return jsonify({"error": "Demasiados intentos. Espera unos minutos."}), 429
+    validar_csrf()
     usuario = request.form.get("usuario", "")
     clave = request.form.get("clave", "")
     usuario_ok = hmac.compare_digest(usuario.encode(), ADMIN_USUARIO.encode())
