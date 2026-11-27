@@ -318,7 +318,9 @@ def login():
         return jsonify({"mensaje": "Bienvenido, administrador"})
     LOGIN_FALLIDOS.inc()
     _registrar_fallo(ip)
-    app.logger.warning("Login fallido para el usuario '%s' desde %s", usuario, request.remote_addr)
+    # Se limpia el usuario antes de escribirlo en el log: sin saltos de línea ni texto largo (inyección en logs).
+    usuario_log = re.sub(r"[^\w.@-]", "_", usuario)[:50]
+    app.logger.warning("Login fallido para el usuario '%s' desde %s", usuario_log, ip)
     return jsonify({"error": "Credenciales inválidas"}), 401
 
 
