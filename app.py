@@ -5,22 +5,35 @@
 Además de las rutas de negocio, la app publica métricas para Prometheus en /metrics.
 Las métricas de seguridad (logins fallidos y peticiones sospechosas) se ven en Grafana.
 """
-import hashlib
+import hmac
 import os
 import re
+import secrets
 import sqlite3
+import threading
 import time
 
-from flask import Flask, Response, g, jsonify, render_template_string, request
+from flask import Flask, Response, abort, g, jsonify, render_template_string, request, session
+from markupsafe import escape
+from werkzeug.security import check_password_hash
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, Histogram, generate_latest
 
 app = Flask(__name__)
 
-## Clave de la aplicación y credenciales del administrador.
-SECRET_KEY = "SecureDev-2024-clave-super-secreta"
-ADMIN_USUARIO = "admin"
-ADMIN_CLAVE_MD5 = "21232f297a57a5a743894a0e4a801fc3"
+## Clave de la aplicación: se lee del entorno (credencial de Jenkins / gestor de secretos).
+## Si no se entrega, se genera una aleatoria al iniciar: nunca queda escrita en el código ni en Git.
+SECRET_KEY = os.environ.get("SECRET_KEY") or secrets.token_hex(32)
+ADMIN_USUARIO = os.environ.get("ADMIN_USUARIO", "admin")
+## Hash de la clave del administrador (PBKDF2/scrypt con sal, generado con werkzeug.security.generate_password_hash).
+## Se entrega por variable de entorno. Si no existe, el acceso de administrador queda deshabilitado
+## (no hay clave por defecto como "admin").
+ADMIN_CLAVE_HASH = os.environ.get("ADMIN_CLAVE_HASH", "")
 app.config["SECRET_KEY"] = SECRET_KEY
+# Cookie de sesión (guarda el token anti-CSRF): no accesible desde JavaScript y no se envía desde otros sitios.
+app.config["SESSION_COOKIE_HTTPONLY"] = True
+app.config["SESSION_COOKIE_SAMESITE"] = "Strict"
+# Con HTTPS en un servidor real también: SESSION_COOKIE_SECURE=True (en el laboratorio se usa HTTP).
+app.config["SESSION_COOKIE_SECURE"] = os.environ.get("COOKIE_SECURE", "0") == "1"
 
 ## Versión desplegada: la inyecta el pipeline (1.0.<build>+<commit>). Sirve para la trazabilidad.
 VERSION = os.environ.get("APP_VERSION", "dev")
@@ -43,6 +56,48 @@ SOSPECHOSAS = Counter("peticiones_sospechosas_total", "Peticiones con patrones d
 APP_INFO = Gauge("app_info", "Versión desplegada de la aplicación", ["version"])
 APP_INFO.labels(version=VERSION).set(1)
 
+## Protección contra fuerza bruta: máximo de logins fallidos por IP dentro de la ventana (segundos).
+MAX_INTENTOS_LOGIN = int(os.environ.get("MAX_INTENTOS_LOGIN", "5"))
+VENTANA_LOGIN_S = int(os.environ.get("VENTANA_LOGIN_S", "300"))
+_intentos_fallidos = {}
+_candado_intentos = threading.Lock()
+
+
+def _ip_bloqueada(ip):
+    """!
+    @brief Indica si la IP superó el máximo de logins fallidos en la ventana de tiempo.
+    @param ip Dirección IP del cliente.
+    @return True si la IP debe esperar antes de volver a intentar.
+    """
+    ahora = time.time()
+    with _candado_intentos:
+        recientes = [t for t in _intentos_fallidos.get(ip, []) if ahora - t < VENTANA_LOGIN_S]
+        _intentos_fallidos[ip] = recientes
+        return len(recientes) >= MAX_INTENTOS_LOGIN
+
+
+def _registrar_fallo(ip):
+    """!
+    @brief Guarda la hora de un login fallido de la IP.
+    @param ip Dirección IP del cliente.
+    """
+    with _candado_intentos:
+        _intentos_fallidos.setdefault(ip, []).append(time.time())
+
+
+## Cabeceras de seguridad que se agregan a TODAS las respuestas (las pide OWASP ZAP).
+CABECERAS_SEGURIDAD = {
+    "Content-Security-Policy": ("default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self'; "
+                                "object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'"),
+    "X-Frame-Options": "DENY",
+    "X-Content-Type-Options": "nosniff",
+    "Referrer-Policy": "no-referrer",
+    "Permissions-Policy": "geolocation=(), camera=(), microphone=()",
+    "Cross-Origin-Opener-Policy": "same-origin",
+    "Cross-Origin-Resource-Policy": "same-origin",
+    "Cache-Control": "no-store",
+}
+
 ## Patrones que delatan un intento de ataque (detección, no bloqueo).
 PATRONES_ATAQUE = {
     "xss": re.compile(r"<\s*script|javascript:|onerror\s*=|onload\s*=|<\s*img", re.I),
@@ -63,15 +118,38 @@ PORTADA = """<!doctype html>
 </ul>
 <h2>Buscar alumno</h2>
 <form action="/alumnos/buscar" method="get">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
   <input name="nombre" value="Ana"> <button type="submit">Buscar</button>
 </form>
 <h2>Acceso administrador</h2>
 <form action="/login" method="post">
-  <input name="usuario" value="admin"> <input name="clave" type="password" value="">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+  <input name="usuario" value="admin"> <input name="clave" type="password" value="" autocomplete="off">
   <button type="submit">Entrar</button>
 </form>
 </body>
 </html>"""
+
+
+def token_csrf():
+    """!
+    @brief Devuelve el token anti-CSRF de la sesión (lo crea la primera vez).
+    @return Token aleatorio de 64 caracteres hexadecimales.
+    """
+    if "csrf_token" not in session:
+        session["csrf_token"] = secrets.token_hex(32)
+    return session["csrf_token"]
+
+
+def validar_csrf():
+    """!
+    @brief Rechaza (HTTP 400) un formulario POST cuyo token no coincide con el de la sesión.
+    """
+    enviado = request.form.get("csrf_token", "")
+    esperado = session.get("csrf_token", "")
+    if not esperado or not hmac.compare_digest(enviado, esperado):
+        app.logger.warning("Token CSRF inválido desde %s a %s", request.remote_addr, request.path)
+        abort(400, description="Token CSRF inválido")
 
 
 def conectar():
@@ -124,7 +202,7 @@ def antes_de_la_peticion():
 @app.after_request
 def despues_de_la_peticion(respuesta):
     """!
-    @brief Registra la métrica de cada petición atendida.
+    @brief Registra la métrica de cada petición atendida y agrega las cabeceras de seguridad.
     @param respuesta Respuesta que Flask enviará al cliente.
     @return La misma respuesta.
     """
@@ -132,6 +210,8 @@ def despues_de_la_peticion(respuesta):
     if endpoint != "/metrics":
         HTTP_PETICIONES.labels(request.method, endpoint, str(respuesta.status_code)).inc()
         HTTP_LATENCIA.labels(endpoint).observe(time.perf_counter() - g.get("inicio", time.perf_counter()))
+    for cabecera, valor in CABECERAS_SEGURIDAD.items():
+        respuesta.headers.setdefault(cabecera, valor)
     return respuesta
 
 
@@ -141,7 +221,7 @@ def portada():
     @brief Portada HTML con enlaces y formularios del sistema.
     @return Página HTML.
     """
-    return render_template_string(PORTADA, version=VERSION)
+    return render_template_string(PORTADA, version=VERSION, csrf_token=token_csrf())
 
 
 @app.route("/hello")
@@ -150,8 +230,9 @@ def hello():
     @brief Saluda al usuario cuyo nombre llega en el parámetro de URL «name».
     @return Página HTML con el saludo.
     """
-    name = request.args.get("name", "visitante")
-    return f"<h1>Hola, {name}!</h1>"
+    name = request.args.get("name", "visitante")[:100]
+    # escape() convierte < > & " ' en entidades HTML: el texto se muestra, pero no se ejecuta.
+    return f"<h1>Hola, {escape(name)}!</h1>"
 
 
 @app.route("/health")
@@ -201,12 +282,16 @@ def buscar_alumnos():
     @brief Busca alumnos cuyo nombre contenga el texto del parámetro «nombre».
     @return JSON con los alumnos encontrados.
     """
-    nombre = request.args.get("nombre", "")
-    consulta = f"SELECT * FROM alumnos WHERE nombre LIKE '%{nombre}%'"
+    nombre = request.args.get("nombre", "")[:100]
+    # Consulta parametrizada: el valor viaja separado del SQL y nunca se interpreta como código.
     try:
-        filas = conectar().execute(consulta).fetchall()
-    except sqlite3.Error as error:
-        return jsonify({"error": str(error), "consulta": consulta}), 500
+        filas = conectar().execute(
+            "SELECT * FROM alumnos WHERE nombre LIKE ? ORDER BY id", (f"%{nombre}%",)
+        ).fetchall()
+    except sqlite3.Error:
+        # Se registra el detalle en el log del servidor, pero al cliente no se le muestra SQL ni el error.
+        app.logger.exception("Error al buscar alumnos")
+        return jsonify({"error": "Error interno"}), 500
     return jsonify([dict(f) for f in filas])
 
 
@@ -216,13 +301,26 @@ def login():
     @brief Valida las credenciales del administrador enviadas por formulario.
     @return JSON con el resultado; 401 si las credenciales no son válidas.
     """
+    ip = request.remote_addr or "desconocida"
+    if _ip_bloqueada(ip):
+        LOGIN_FALLIDOS.inc()
+        app.logger.warning("Login bloqueado por exceso de intentos desde %s", ip)
+        return jsonify({"error": "Demasiados intentos. Espera unos minutos."}), 429
+    validar_csrf()
     usuario = request.form.get("usuario", "")
     clave = request.form.get("clave", "")
-    if usuario == ADMIN_USUARIO and hashlib.md5(clave.encode()).hexdigest() == ADMIN_CLAVE_MD5:
+    usuario_ok = hmac.compare_digest(usuario.encode(), ADMIN_USUARIO.encode())
+    clave_ok = bool(ADMIN_CLAVE_HASH) and check_password_hash(ADMIN_CLAVE_HASH, clave)
+    if usuario_ok and clave_ok:
         LOGIN_EXITOSOS.inc()
+        with _candado_intentos:
+            _intentos_fallidos.pop(ip, None)
         return jsonify({"mensaje": "Bienvenido, administrador"})
     LOGIN_FALLIDOS.inc()
-    app.logger.warning("Login fallido para el usuario '%s' desde %s", usuario, request.remote_addr)
+    _registrar_fallo(ip)
+    # Se limpia el usuario antes de escribirlo en el log: sin saltos de línea ni texto largo (inyección en logs).
+    usuario_log = re.sub(r"[^\w.@-]", "_", usuario)[:50]
+    app.logger.warning("Login fallido para el usuario '%s' desde %s", usuario_log, ip)
     return jsonify({"error": "Credenciales inválidas"}), 401
 
 
@@ -238,4 +336,6 @@ def metrics():
 iniciar_db()
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    # Solo para desarrollo local: sin depurador (permite ejecutar código) y escuchando solo en localhost.
+    # En staging/producción la app corre con gunicorn (scripts/deploy.sh), no con este bloque.
+    app.run(host="127.0.0.1", port=5000, debug=False)
