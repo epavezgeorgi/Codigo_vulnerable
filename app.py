@@ -5,7 +5,7 @@
 Además de las rutas de negocio, la app publica métricas para Prometheus en /metrics.
 Las métricas de seguridad (logins fallidos y peticiones sospechosas) se ven en Grafana.
 """
-import hashlib
+import hmac
 import os
 import re
 import secrets
@@ -14,6 +14,7 @@ import time
 
 from flask import Flask, Response, g, jsonify, render_template_string, request
 from markupsafe import escape
+from werkzeug.security import check_password_hash
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, Histogram, generate_latest
 
 app = Flask(__name__)
@@ -21,8 +22,11 @@ app = Flask(__name__)
 ## Clave de la aplicación: se lee del entorno (credencial de Jenkins / gestor de secretos).
 ## Si no se entrega, se genera una aleatoria al iniciar: nunca queda escrita en el código ni en Git.
 SECRET_KEY = os.environ.get("SECRET_KEY") or secrets.token_hex(32)
-ADMIN_USUARIO = "admin"
-ADMIN_CLAVE_MD5 = "21232f297a57a5a743894a0e4a801fc3"
+ADMIN_USUARIO = os.environ.get("ADMIN_USUARIO", "admin")
+## Hash de la clave del administrador (PBKDF2/scrypt con sal, generado con werkzeug.security.generate_password_hash).
+## Se entrega por variable de entorno. Si no existe, el acceso de administrador queda deshabilitado
+## (no hay clave por defecto como "admin").
+ADMIN_CLAVE_HASH = os.environ.get("ADMIN_CLAVE_HASH", "")
 app.config["SECRET_KEY"] = SECRET_KEY
 
 ## Versión desplegada: la inyecta el pipeline (1.0.<build>+<commit>). Sirve para la trazabilidad.
@@ -226,7 +230,9 @@ def login():
     """
     usuario = request.form.get("usuario", "")
     clave = request.form.get("clave", "")
-    if usuario == ADMIN_USUARIO and hashlib.md5(clave.encode()).hexdigest() == ADMIN_CLAVE_MD5:
+    usuario_ok = hmac.compare_digest(usuario.encode(), ADMIN_USUARIO.encode())
+    clave_ok = bool(ADMIN_CLAVE_HASH) and check_password_hash(ADMIN_CLAVE_HASH, clave)
+    if usuario_ok and clave_ok:
         LOGIN_EXITOSOS.inc()
         return jsonify({"mensaje": "Bienvenido, administrador"})
     LOGIN_FALLIDOS.inc()
